@@ -311,6 +311,57 @@ def test_fused_kda_decode_processes_zero_slot():
     assert not torch.equal(out, torch.zeros_like(out)), "no output written for slot 0"
 
 
+def test_fused_kda_decode_strided_state_indices():
+    """Normal decode reads a non-contiguous [B] index view with its stride."""
+    torch.manual_seed(42)
+    batch, Hloc, D = 4, 2, 128
+    inp = _make_inputs(batch, Hloc, D)
+    base = torch.zeros(batch * 2, dtype=torch.int32, device=device)
+    base[::2] = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
+    strided = base[::2]
+    assert strided.stride(0) == 2
+    assert not strided.is_contiguous()
+    inp["ssm_state_indices"] = strided
+
+    ref = _ref_kda_decode(
+        inp["mixed_qkv"],
+        inp["conv_state"].clone(),
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["ssm_state"].clone(),
+        strided,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        D,
+        Hloc,
+        -5.0,
+    )
+    out = fused_kda_decode(
+        inp["mixed_qkv"],
+        inp["conv_state"].clone(),
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["ssm_state"].clone(),
+        strided,
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        1e-6,
+        D,
+        Hloc,
+        -5.0,
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=0.02)
+
+
 def test_fused_kda_decode_rejects_noncontiguous_out():
     """The kernels address out as tok * (H * V) + channel."""
     batch, Hloc, D = 2, 2, 128
@@ -829,12 +880,8 @@ def test_spec_decode_null_token_does_not_write_output(null_pos, num_spec):
     "last" is the shape vLLM produces: NULL slots are the padded tail of an
     index row.
 
-    "first" is not: it needs conv_state_indices passed independently rather
-    than as ssm_state_indices[:, 0], since with that slice a NULL first token
-    zeroes conv_state_idx and the sequence returns earlier. It pins one narrow
-    property for such a caller, that a skipped token does not drag the rollback
-    in with it. The resulting cache is not coherent either way, token 0's own
-    position is never written."""
+    "first" stops the sequence. Tokens after the first invalid slot are not
+    computed, and the convolution cache is left unchanged."""
     inp = _make_spec_inputs(1, 2, num_spec=num_spec, full_spec_sequence=True)
     if null_pos == "last":
         null_tok = inp["state_indices"].shape[1] - 1
@@ -844,7 +891,7 @@ def test_spec_decode_null_token_does_not_write_output(null_pos, num_spec):
     inp["state_indices"][0, null_tok] = 0
     cidx = int(inp["conv_state_indices"][0].item())
     before_slot0 = inp["state"][0].clone()
-    before_rollback = inp["conv_state"][cidx, :, :2].clone()
+    before_conv = inp["conv_state"][cidx].clone()
     out = torch.zeros(num_spec + 1, 2 * SPEC_D, dtype=torch.bfloat16, device=device)
     _run_spec(inp, out=out)
     torch.testing.assert_close(
@@ -854,11 +901,8 @@ def test_spec_decode_null_token_does_not_write_output(null_pos, num_spec):
     if null_pos == "last":
         assert out[:null_tok].abs().max().item() > 0
     else:
-        # The skipped token must not have dragged the rollback in with it.
-        torch.testing.assert_close(
-            inp["conv_state"][cidx, :, :2], before_rollback, atol=0, rtol=0
-        )
-        assert out[null_tok + 1 :].abs().max().item() > 0
+        torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+        torch.testing.assert_close(inp["conv_state"][cidx], before_conv, atol=0, rtol=0)
 
 
 def _run_spec(inp, conv_weight=None, out=None):
@@ -882,6 +926,50 @@ def _run_spec(inp, conv_weight=None, out=None):
         num_accepted_tokens=inp["num_accepted_tokens"],
         conv_state_indices=inp["conv_state_indices"],
         out=out,
+    )
+
+
+def test_spec_decode_batch_one_zero_stride_conv_indices():
+    """A single sequence only ever forms offset 0, so a broadcast
+    conv_state_indices must still select its slot. The kernels assume a positive
+    stride, which a stride of 0 would violate."""
+    inp = _make_spec_inputs(1, 2, num_spec=7, full_spec_sequence=True)
+    packed = inp["conv_state_indices"]
+    broadcast = packed.as_strided((1,), (0,))
+    assert broadcast.stride(0) == 0, "test would be vacuous on a packed tensor"
+    assert int(broadcast[0].item()) == int(packed[0].item())
+
+    pristine_cs, pristine_ss = inp["conv_state"].clone(), inp["state"].clone()
+    ref = _run_spec(inp)
+    ref_cs, ref_ss = inp["conv_state"].clone(), inp["state"].clone()
+
+    inp["conv_state"], inp["state"] = pristine_cs, pristine_ss
+    inp["conv_state_indices"] = broadcast
+    out = _run_spec(inp)
+
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    torch.testing.assert_close(pristine_cs, ref_cs, atol=0, rtol=0)
+    torch.testing.assert_close(pristine_ss, ref_ss, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_spec", [7, 2])
+def test_spec_decode_null_hole_drops_later_tokens(num_spec):
+    """A NULL between valid slots is not written through. Tokens after it stay
+    at the preallocated output, and their convolution positions stay put."""
+    inp = _make_spec_inputs(1, 2, num_spec=num_spec, full_spec_sequence=True)
+    assert inp["state_indices"].shape[1] >= 3
+    inp["state_indices"][0, 1] = 0
+    cidx = int(inp["conv_state_indices"][0].item())
+    before_tail = inp["conv_state"][cidx, :, 3:].clone()
+    before_tok0 = inp["conv_state"][cidx, :, 2].clone()
+    n_tok = inp["state_indices"].shape[1]
+    out = torch.zeros(n_tok, 2 * SPEC_D, dtype=torch.bfloat16, device=device)
+    _run_spec(inp, out=out)
+    assert out[0].abs().max().item() > 0
+    torch.testing.assert_close(out[1:], torch.zeros_like(out[1:]), atol=0, rtol=0)
+    assert not torch.equal(inp["conv_state"][cidx, :, 2], before_tok0)
+    torch.testing.assert_close(
+        inp["conv_state"][cidx, :, 3:], before_tail, atol=0, rtol=0
     )
 
 

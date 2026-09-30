@@ -1,0 +1,5 @@
+{
+    "fused_conv_recurrent_norm_kernel": {
+        "num_warps": 2
+    }
+}

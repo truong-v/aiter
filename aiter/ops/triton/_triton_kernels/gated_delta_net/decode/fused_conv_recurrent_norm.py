@@ -25,6 +25,29 @@ _fused_kda_spec_finalize_repr = make_kernel_repr(
 )
 
 
+@triton.jit
+def _valid_spec_prefix(
+    ssm_state_indices_ptr,
+    i_n,
+    stride_indices_seq,
+    stride_indices_tok,
+    SPEC_LEN: tl.constexpr,
+):
+    """Count the leading speculative tokens holding a live cache slot.
+
+    vLLM appends NULL (slot 0) and PAD (negative) entries as a suffix, so the
+    count is also where the row stops. Committing a token at W - 2 + i_t past a
+    skipped one would leave a stale hole in the convolution history.
+    """
+    valid = SPEC_LEN
+    for j in tl.static_range(SPEC_LEN):
+        idx_j = tl.load(
+            ssm_state_indices_ptr + i_n * stride_indices_seq + j * stride_indices_tok
+        ).to(tl.int64)
+        valid = tl.where(idx_j <= 0, tl.minimum(valid, j), valid)
+    return valid
+
+
 @triton.jit(repr=_fused_conv_recurrent_norm_repr)
 def fused_conv_recurrent_norm_kernel(
     # Conv1d inputs
@@ -119,7 +142,9 @@ def fused_conv_recurrent_norm_kernel(
         if state_idx <= 0 or conv_state_idx <= 0:
             return
     else:
-        state_idx = tl.load(ssm_state_indices_ptr + i_n).to(tl.int64)
+        state_idx = tl.load(ssm_state_indices_ptr + i_n * stride_indices_seq).to(
+            tl.int64
+        )
         conv_state_idx = state_idx
         # Normal decode keeps zero-based slots valid; only PAD_SLOT_ID (< 0)
         # is skipped.
@@ -196,6 +221,16 @@ def fused_conv_recurrent_norm_kernel(
             n_tok = tl.minimum(n_tok, conv_room)
         else:
             n_tok = 0
+        n_tok = tl.minimum(
+            n_tok,
+            _valid_spec_prefix(
+                ssm_state_indices_ptr,
+                i_n,
+                stride_indices_seq,
+                stride_indices_tok,
+                SPEC_LEN=SPEC_LEN,
+            ),
+        )
     else:
         n_tok = seq_T
     for i_t in range(n_tok):
@@ -273,29 +308,27 @@ def fused_conv_recurrent_norm_kernel(
         b_v = b_v * tl.sigmoid(b_v)
 
         if IS_SPEC_DECODING:
-            # Slot 0 is vLLM's NULL block. Skip the history roll and the
-            # cache write so a padded token does not advance conv state.
+            # n_tok stops at the first invalid slot, so this one is live.
             output_state_idx = tl.load(
                 ssm_state_indices_ptr
                 + i_n * stride_indices_seq
                 + i_t * stride_indices_tok
             ).to(tl.int64)
-            if output_state_idx > 0:
-                q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
-                k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
-                v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
-                tl.store(
-                    p_csq + (W - 2 + i_t) * stride_cs_pos,
-                    b_x_q.to(p_csq.dtype.element_ty),
-                )
-                tl.store(
-                    p_csk + (W - 2 + i_t) * stride_cs_pos,
-                    b_x_k.to(p_csk.dtype.element_ty),
-                )
-                tl.store(
-                    p_csv + (W - 2 + i_t) * stride_cs_pos,
-                    b_x_v.to(p_csv.dtype.element_ty),
-                )
+            q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
+            k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
+            v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
+            tl.store(
+                p_csq + (W - 2 + i_t) * stride_cs_pos,
+                b_x_q.to(p_csq.dtype.element_ty),
+            )
+            tl.store(
+                p_csk + (W - 2 + i_t) * stride_cs_pos,
+                b_x_k.to(p_csk.dtype.element_ty),
+            )
+            tl.store(
+                p_csv + (W - 2 + i_t) * stride_cs_pos,
+                b_x_v.to(p_csv.dtype.element_ty),
+            )
         else:
             # Layouts with more threads than channels replicate conv vectors,
             # so several owners shift the same slots. Read every source slot
@@ -366,32 +399,29 @@ def fused_conv_recurrent_norm_kernel(
         b_v = b_v * b_beta
         b_h_next = b_h_next + b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h_next * b_q[None, :], 1)
-        # A speculative NULL slot (vLLM slot 0) must not advance the carried
-        # state or write the preallocated output. Normal decode always writes.
         if IS_SPEC_DECODING:
-            if output_state_idx > 0:
-                b_h = b_h_next
-                tl.assume(output_state_idx > 0)
-                p_h_out = (
-                    ssm_state_ptr
-                    + output_state_idx * stride_ssm_slot
-                    + i_h * V * K
-                    + o_v[:, None] * K
-                    + o_k[None, :]
-                )
-                tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
-                b_o_rounded = b_o.to(tl.bfloat16).to(tl.float32)
-                o_sumsq = tl.sum(b_o_rounded * b_o_rounded)
-                rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
-                b_w = tl.load(norm_weight_ptr + o_v).to(tl.float32)
-                b_og = tl.load(out_gate_ptr + tok * stride_og_tok + i_h * V + o_v).to(
-                    tl.float32
-                )
-                b_y = b_o_rounded * rstd * b_w * tl.sigmoid(b_og)
-                tl.store(
-                    out_ptr + tok * (H * V) + i_h * V + o_v,
-                    b_y.to(out_ptr.dtype.element_ty),
-                )
+            b_h = b_h_next
+            tl.assume(output_state_idx > 0)
+            p_h_out = (
+                ssm_state_ptr
+                + output_state_idx * stride_ssm_slot
+                + i_h * V * K
+                + o_v[:, None] * K
+                + o_k[None, :]
+            )
+            tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
+            b_o_rounded = b_o.to(tl.bfloat16).to(tl.float32)
+            o_sumsq = tl.sum(b_o_rounded * b_o_rounded)
+            rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
+            b_w = tl.load(norm_weight_ptr + o_v).to(tl.float32)
+            b_og = tl.load(out_gate_ptr + tok * stride_og_tok + i_h * V + o_v).to(
+                tl.float32
+            )
+            b_y = b_o_rounded * rstd * b_w * tl.sigmoid(b_og)
+            tl.store(
+                out_ptr + tok * (H * V) + i_h * V + o_v,
+                b_y.to(out_ptr.dtype.element_ty),
+            )
         else:
             b_h = b_h_next
             tl.store(p_h, b_h.to(p_h.dtype.element_ty))
@@ -571,7 +601,16 @@ def fused_kda_spec_parallel_v_kernel(
 
     # Software-pipeline token-dependent loads while preserving the loop-carried
     # recurrent state dependency.
-    n_tok = tl.minimum(seq_t, SPEC_LEN)
+    n_tok = tl.minimum(
+        tl.minimum(seq_t, SPEC_LEN),
+        _valid_spec_prefix(
+            ssm_state_indices_ptr,
+            i_n,
+            stride_indices_seq,
+            stride_indices_tok,
+            SPEC_LEN=SPEC_LEN,
+        ),
+    )
     for i_t in tl.range(0, n_tok, num_stages=2):
         tok = bos + i_t
         p_x = x_ptr + tok * stride_x_tok
@@ -598,28 +637,26 @@ def fused_kda_spec_parallel_v_kernel(
         b_h_next = b_h_next + b_u[:, None] * b_k[None, :]
         b_o = tl.sum(b_h_next * b_q[None, :], 1)
 
-        # Slot 0 is vLLM's NULL block: do not roll conv history, advance the
-        # recurrent state, or write this token's output.
+        # n_tok stops at the first invalid slot, so this one is live.
         output_state_idx = tl.load(
             ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
         ).to(tl.int64)
-        if output_state_idx > 0:
-            q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
-            k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
-            v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
-            b_h = b_h_next
-            p_h_out = (
-                ssm_state_ptr
-                + output_state_idx * stride_ssm_slot
-                + i_h * V * K
-                + (v_base + o_v[:, None]) * K
-                + o_k[None, :]
-            )
-            tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
-            tl.store(
-                out_ptr + tok * (H * V) + i_h * V + v_base + o_v,
-                b_o.to(out_ptr.dtype.element_ty),
-            )
+        q_h0, q_h1, q_h2 = q_h1, q_h2, b_x_q
+        k_h0, k_h1, k_h2 = k_h1, k_h2, b_x_k
+        v_h0, v_h1, v_h2 = v_h1, v_h2, b_x_v
+        b_h = b_h_next
+        p_h_out = (
+            ssm_state_ptr
+            + output_state_idx * stride_ssm_slot
+            + i_h * V * K
+            + (v_base + o_v[:, None]) * K
+            + o_k[None, :]
+        )
+        tl.store(p_h_out, b_h.to(p_h_out.dtype.element_ty))
+        tl.store(
+            out_ptr + tok * (H * V) + i_h * V + v_base + o_v,
+            b_o.to(out_ptr.dtype.element_ty),
+        )
 
 
 @triton.jit(repr=_fused_kda_spec_finalize_repr)
@@ -681,6 +718,15 @@ def fused_kda_spec_finalize_kernel(
     conv_state_idx = tl.load(conv_state_indices_ptr + i_n * stride_cidx).to(tl.int64)
     if read_state_idx <= 0 or conv_state_idx <= 0:
         return
+    # Matches the token window the parallel kernel computed.
+    if i_t >= _valid_spec_prefix(
+        ssm_state_indices_ptr,
+        i_n,
+        stride_indices_seq,
+        stride_indices_tok,
+        SPEC_LEN=SPEC_LEN,
+    ):
+        return
     tl.assume(conv_state_idx > 0)
     lp: tl.constexpr = H * K
     o_k = tl.max_contiguous(tl.arange(0, K), K)
@@ -692,15 +738,6 @@ def fused_kda_spec_finalize_kernel(
     p_csq = p_cs + (q_off + o_k) * stride_cs_dim
     p_csk = p_cs + (k_off + o_k) * stride_cs_dim
     p_csv = p_cs + (v_off + o_v) * stride_cs_dim
-
-    # The accepted-checkpoint check above does not cover a later NULL token.
-    # Must precede the i_t == 0 rollback: committing it for a token that is then
-    # skipped leaves the cache half-updated.
-    token_state_idx = tl.load(
-        ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
-    ).to(tl.int64)
-    if token_state_idx <= 0:
-        return
 
     if i_t == 0:
         carry_base = i_n * (3 * lp * 2)

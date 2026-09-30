@@ -7,6 +7,8 @@ Single Triton kernel launch. Fuses three separate operations into one,
 eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 """
 
+import functools
+
 import torch
 import triton
 
@@ -18,10 +20,22 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_conv_recurren
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
-# Launch params only. The BV tile comes from
-# configs/<arch>/triton/attention/fused_kda_decode/DEFAULT.json; without it the
-# speculative path is not taken at all (see the dispatch below).
-_SPEC_KERNEL_FALLBACK = triton.Config({}, num_warps=2, num_stages=2)
+# Tile for an arch with no published entry. Measured num_warps, num_stages, and
+# BV live in configs/<arch>/triton/attention/fused_kda_decode/DEFAULT.json.
+# Without a published BV the speculative path is not taken (see the dispatch).
+_KERNEL_FALLBACK = triton.Config({}, num_warps=4, num_stages=2)
+
+
+@functools.cache
+def _launch_config(kernel_name: str) -> triton.Config:
+    """Read-only launch config, resolved once per kernel per process.
+
+    Decode runs this per step, and an arch with no published entry warns on
+    every miss, so the uncached call would log once per launch.
+    """
+    return get_tuned_kernel_config(
+        "attention", "FUSED_KDA_DECODE", kernel_name, _KERNEL_FALLBACK
+    )
 
 
 def fused_kda_decode(
@@ -125,6 +139,14 @@ def fused_kda_decode(
         stride_indices_tok = 1
         # Unused off the speculative path; the pointers alias ssm_state_indices.
         stride_cidx = 1
+    # Every kernel declares tl.assume(stride > 0) on these two. A single
+    # sequence only ever forms i_n == 0, so the offset is zero whatever the
+    # stride is, but a broadcast tensor's stride of 0 would make that
+    # assumption false and license wrong codegen. The checks above already
+    # reject a stride that would actually mis-address, at batch > 1.
+    if batch <= 1:
+        stride_cidx = max(stride_cidx, 1)
+        stride_indices_seq = max(stride_indices_seq, 1)
     num_accepted_tokens_arg = (
         num_accepted_tokens if num_accepted_tokens is not None else ssm_state_indices
     )
@@ -170,12 +192,7 @@ def fused_kda_decode(
     parallel_cfg = None
     block_v = 0
     if is_spec_decoding and get_arch() == "gfx950":
-        cfg = get_tuned_kernel_config(
-            "attention",
-            "FUSED_KDA_DECODE",
-            "fused_kda_spec_parallel_v_kernel",
-            _SPEC_KERNEL_FALLBACK,
-        )
+        cfg = _launch_config("fused_kda_spec_parallel_v_kernel")
         # An unpublished tile drops to the generic kernel rather than raising.
         bv = cfg.kwargs.get("BV")
         if bv is not None:
@@ -215,12 +232,7 @@ def fused_kda_decode(
         # graph capture. Both kernels clamp each sequence to SPEC_LEN, so a
         # packed batch with a short sequence still takes this path, and a span
         # longer than the index row drops the surplus tokens.
-        finalize_cfg = get_tuned_kernel_config(
-            "attention",
-            "FUSED_KDA_DECODE",
-            "fused_kda_spec_finalize_kernel",
-            _SPEC_KERNEL_FALLBACK,
-        )
+        finalize_cfg = _launch_config("fused_kda_spec_finalize_kernel")
         conv_carry = torch.empty(
             batch,
             3 * H * K,
@@ -296,6 +308,7 @@ def fused_kda_decode(
         )
         return out
 
+    generic_cfg = _launch_config("fused_conv_recurrent_norm_kernel")
     grid = (batch, H)
     fused_conv_recurrent_norm_kernel[grid](
         mixed_qkv,
@@ -337,6 +350,6 @@ def fused_kda_decode(
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
         stride_cidx=stride_cidx,
-        num_warps=2 if get_arch() in ("gfx942", "gfx950") else 4,
+        num_warps=generic_cfg.num_warps,
     )
     return out
